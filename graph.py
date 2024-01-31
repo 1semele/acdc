@@ -42,6 +42,23 @@ pretrained_weights = t.load(weights_path, map_location=device)
 model.load_state_dict(pretrained_weights)
 # %%
 
+class Node:
+    def __init__(self, name, layer=-1, head=-1):
+        self.name = name
+        self.head = head
+        self.layer = layer
+        self.mark = 0
+        self.edges = []
+        pass
+
+    def add_edge(self, edge):
+        self.edges.append(edge)
+
+class Edge:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
 class Graph:
     def __init__(self, model):
         self.model = model
@@ -50,27 +67,49 @@ class Graph:
         self.nodes = []
         self.edges = []
 
-        self.nodes.append(Node("END"))
-
         for layer in range(cfg.n_layers):
             for head in range(cfg.n_heads):
                 node = Node(f"block.{layer}.attn.hook_q", layer=layer, head=head)
                 self.nodes.append(node)
 
-        for i, start_node in enumerate(self.nodes):
-            start_idx = start_node.layer * cfg.n_heads + (cfg.n_heads - start_node.head)
-            for j in range(start_idx, len(self.nodes)):
-                edge = Edge(start_node, self.nodes[j])
+        end_node = Node("END")
+        self.nodes.append(end_node)
+
+        for start_node in self.nodes[:-1]:
+            if start_node.layer == cfg.n_layers - 1:
+                edge = Edge(start_node, end_node)
                 self.edges.append(edge)
+            else:
+                start_idx = (start_node.layer + 1) * cfg.n_heads
+                for end_node in self.nodes[start_idx:]:
+                    edge = Edge(start_node, end_node)
+                    self.edges.append(edge)
 
-class Node:
-    def __init__(self, name, layer=-1, head=-1):
-        self.name = name
-        self.head = head
-        self.layer = layer
-        pass
+    def reverse_topo_sort(self):
+        sort = []
+        
+        def visit(n):
+            if n.mark == 2:
+                return
+            elif n.mark == 1:
+                print("ERROR: edge cycle")
+                exit()
+            
+            n.mark = 1
 
-class Edge:
-    def __init__(self, start, end):
-        self.start = start
-        self.end = end
+            for edge in n.edges:
+                visit(edge.end)
+            
+            n.mark = 2
+            sort.append(n)
+                
+            
+        for node in self.nodes:
+            visit(node)
+
+        return list(reversed(sort))
+
+
+g = Graph(model)
+sort = g.reverse_topo_sort()
+# %%
