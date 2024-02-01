@@ -43,7 +43,11 @@ model = HookedTransformer(cfg)
 pretrained_weights = t.load(weights_path, map_location=device)
 model.load_state_dict(pretrained_weights)
 model.set_use_split_qkv_input(True)
+model.set_use_attn_result(True)
 # %%
+
+EDGE_FAKE = 1
+EDGE_REAL = 2
 
 class Node:
     def __init__(self, name, layer=-1, head=-1):
@@ -66,12 +70,22 @@ class Node:
         self.parents.append(edge)
 
 class Edge:
-    def __init__(self, start, end):
+    def __init__(self, start, end, type):
         self.frozen = False
         self.start = start
         self.end = end
+        self.type = type
 
 class Graph:
+    def add_node(self, node):
+        self.nodes.append(node)
+        self.node_dict[node.name] = node
+
+    def add_edge(self, edge):
+        self.edges.append(edge)
+        edge.start.add_child(edge)
+        edge.end.add_parent(edge)
+
     def __init__(self, model):
         self.model = model
         cfg = model.cfg
@@ -80,36 +94,48 @@ class Graph:
         self.node_dict = {}
         self.edges = []
 
-        for layer in range(cfg.n_layers):
+        for layer in range(cfg.n_layers - 1, -1, -1):
             for head in range(cfg.n_heads):
-                node = Node(f"blocks.{layer}.attn.hook_q_input", layer=layer, head=head)
-                self.nodes.append(node)
-                node = Node(f"blocks.{layer}.attn.hook_k_input", layer=layer, head=head)
-                self.nodes.append(node)
-                node = Node(f"blocks.{layer}.attn.hook_v_input", layer=layer, head=head)
-                self.nodes.append(node)
+                q = Node(f"blocks.{layer}.hook_q_input", layer=layer, head=head)
+                self.add_node(q)
+                k = Node(f"blocks.{layer}.hook_k_input", layer=layer, head=head)
+                self.add_node(k)
+                v = Node(f"blocks.{layer}.hook_v_input", layer=layer, head=head)
+                self.add_node(v)
+                output = Node(f"blocks.{layer}.attn.result", layer=layer, head=head)
+                self.add_node(output)
+
+                self.add_edge(Edge(q, output, EDGE_FAKE))
+                self.add_edge(Edge(k, output, EDGE_FAKE))
+                self.add_edge(Edge(v, output, EDGE_FAKE))
+
+                for forward_layer in range(layer + 1, cfg.n_layers):
+                    for forward_head in range(cfg.n_heads):
+                        q_str = f"blocks.{forward_layer}.hook_q_input.{forward_head}"
+                        k_str = f"blocks.{forward_layer}.hook_k_input.{forward_head}"
+                        v_str = f"blocks.{forward_layer}.hook_v_input.{forward_head}"
+                        self.add_edge(Edge(output, self.node_dict[q_str], EDGE_REAL))
+                        self.add_edge(Edge(output, self.node_dict[k_str], EDGE_REAL))
+                        self.add_edge(Edge(output, self.node_dict[v_str], EDGE_REAL))
+                        
 
         end_node = Node("END")
-        self.nodes.append(end_node)
+        self.add_node(end_node)
 
         for start_node in self.nodes[:-1]:
             if start_node.layer == cfg.n_layers - 1:
-                edge = Edge(start_node, end_node)
+                edge = Edge(start_node, end_node, EDGE_FAKE)
                 self.edges.append(edge)
                 start_node.add_child(edge)
                 end_node.add_parent(edge)
-
             else:
                 start_idx = (start_node.layer + 1) * cfg.n_heads * 3
                 for end_node in self.nodes[start_idx:]:
-                    edge = Edge(start_node, end_node)
-                    self.edges.append(edge)
-                    start_node.add_child(edge)
-                    end_node.add_parent(edge)
-
-    def build_node_dict(self):
-        for node in self.nodes:
-            self.node_dict[node.name] = node
+                    if re.match(".result", end_node.name):
+                        edge = Edge(start_node, end_node, EDGE_REAL)
+                        self.edges.append(edge)
+                        start_node.add_child(edge)
+                        end_node.add_parent(edge)
 
     def reverse_topo_sort(self):
         sort = []
@@ -135,7 +161,8 @@ class Graph:
         return sort
 
 g = Graph(model)
-g.build_node_dict()
+sort = g.reverse_topo_sort()
+
 # %%
 
 batch = 10
@@ -151,43 +178,52 @@ dirty_prompt = t.cat([prefix, rand_tokens], dim=1).to(device)
 
 # %%
 
-def recieve_hook(val, hook, g, clean_cache, dirty_cache):
+def recieve_hook(val, hook, g):
     for head in range(cfg.n_heads):
         node = g.node_dict[hook.name + '.' + str(head)]
         for prev_edge in node.parents:
-            if prev_edge.frozen:
+            print(prev_edge.type)
+            if prev_edge.frozen and prev_edge.type == EDGE_REAL:
                 prev_node = prev_edge.start
-#                print(f"frozen {prev_node.name} -> {node.name}")
-                val[..., head, :] += clean_cache[prev_node.tl_name][..., head, :]
-                val[..., head, :] -= dirty_cache[prev_node.tl_name][..., head, :]
+                print(f"{prev_node.name} -> {node.name}")
+                val[..., head, :] += prev_node.corr 
+                val[..., head, :] -= prev_node.clean
 
-def send_hook(val, hook, g, first):
-    pass
+def send_hook(val, hook, g, is_clean):
+    for head in range(cfg.n_heads):
+        node = g.node_dict[hook.name + '.' + str(head)]
+        if is_clean:
+            node.clean = val[:, :, head, :]
+        else:
+            node.corr = val[:, :, head, :]
 
-def is_attn_component(str):
-    return re.match("blocks.*.attn.hook_q", str) or \
-           re.match("blocks.*.attn.hook_k", str) or \
-           re.match("blocks.*.attn.hook_v", str)
+def is_attn_component(name):
+    return re.match("blocks.*.hook_q_input", name) 
+#           re.match("blocks.*.attn.hook_k", str) or
+#           re.match("blocks.*.attn.hook_v", str)
 
 # %%
 
-def generate_hooks(g, clean_cache, dirty_cache):
-    first_recieve = partial(recieve_hook, g=g, clean_cache=clean_cache, dirty_cache=dirty_cache)
-#    first_send = partial(send_hook, g=g)
-#    second_send = partial(send_hook, g=g)
-#    first_hooks = [(is_attn_component, first_recieve), (is_attn_component, first_send)]
-#    second_hooks = [(is_attn_component, second_recieve), (is_attn_component, second_send)]
-    first_hooks = [(is_attn_component, first_recieve)]
-    return first_hooks
+def generate_hooks(g):
+    recieve = partial(recieve_hook, g=g)
+    first_send = partial(send_hook, g=g, is_clean=True)
+    second_send = partial(send_hook, g=g, is_clean=False)
+    hook1 = [(is_attn_component, first_send)]
+    hook2 = [(is_attn_component, second_send)]
+    hook3 = [(is_attn_component, recieve)]
+    return hook1, hook2, hook3
 
 def run_model(model, g):
-    clean_logits, clean_cache = model.run_with_cache(clean_prompt)
-    dirty_logits, dirty_cache = model.run_with_cache(dirty_prompt)
 
-    first_hooks = generate_hooks(g, clean_cache, dirty_cache)
+    hook1, hook2, hook3 = generate_hooks(g)
 
-    logits = model.run_with_hooks(clean_prompt, fwd_hooks=first_hooks)
-    return logits[:, -2, :]
+    _ = model.run_with_hooks(clean_prompt, fwd_hooks=hook1)
+    _ = model.run_with_hooks(dirty_prompt, fwd_hooks=hook2)
+
+    logits = model.run_with_hooks(clean_prompt, fwd_hooks=hook3)[:, -1, :]
+#    print(logits)
+
+    return logits
 
 def disable_edge(g, edge):
     edge.frozen = True
@@ -203,6 +239,8 @@ def acdc(model, g, threshold):
     h_list = g.reverse_topo_sort()
     for v in tqdm(h_list):
         for w_edge in tqdm(v.parents, leave=False):
+            if w_edge.type == EDGE_FAKE:
+                continue
             w = w_edge.start
 #            print("TESTING: " + w.name + ' -> ' + v.name)
 
@@ -217,13 +255,12 @@ def acdc(model, g, threshold):
 
             kl_diff = h_new_kl - h_kl 
             w_edge.kl_diff = kl_diff.item()
-#            print(kl_diff)
+            print(kl_diff.item())
 #            print(w.name + ' -> ' + v.name + ': ' + str(kl_diff.item()))
             if kl_diff < threshold:
                 disable_edge(g, w_edge)
 
 g = Graph(model)
-g.build_node_dict()
 acdc(model, g, 0.0575)
 
 alive_edges = []
