@@ -198,9 +198,9 @@ def send_hook(val, hook, g, is_clean):
             node.corr = val[:, :, head, :]
 
 def is_attn_component(name):
-    return re.match("blocks.*.hook_q_input", name) 
-#           re.match("blocks.*.attn.hook_k", str) or
-#           re.match("blocks.*.attn.hook_v", str)
+    return re.match("blocks.*.hook_q_input", name) or \
+           re.match("blocks.*.hook_k_input", str) or \
+           re.match("blocks.*.hook_v_input", str)
 
 # %%
 
